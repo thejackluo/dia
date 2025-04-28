@@ -13,7 +13,7 @@ clone_from_text = "[S1] Dia is an open weights text to dialogue model. [S2] You 
 # clone_from_audio = "your_audio_name.mp3"
 
 # Text to generate
-text_to_generate = "[S1] Hello, how are you? [S2] I'm good, thank you. [S1] What's your name? [S2] My name is Dia. [S1] Nice to meet you. [S2] Nice to meet you too."
+text_to_generate = "[S1] Dia is an open weights text to dialogue model. [S2] You get full control over scripts and voices. [S1] Wow. Amazing. (laughs) [S2] Try it now on Git hub or Hugging Face."
 
 clone_from_audios = [f"simple_{i}.mp3" for i in range(10)]
 

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torchaudio
 
+# Assuming these imports are relative to the package structure
 from .audio import apply_audio_delay, build_delay_indices, build_revert_indices, decode, revert_audio_delay
 from .config import DiaConfig
 from .layers import DiaModel
@@ -28,17 +29,20 @@ def _sample_next_token(
     logits_BCxV: torch.Tensor,
     temperature: float,
     top_p: float,
-    cfg_filter_top_k: int | None = None,
+    audio_eos_value: int,
 ) -> torch.Tensor:
     if temperature == 0.0:
         return torch.argmax(logits_BCxV, dim=-1)
 
     logits_BCxV = logits_BCxV / temperature
-    if cfg_filter_top_k is not None:
-        _, top_k_indices_BCxV = torch.topk(logits_BCxV, k=cfg_filter_top_k, dim=-1)
-        mask = torch.ones_like(logits_BCxV, dtype=torch.bool)
-        mask.scatter_(dim=-1, index=top_k_indices_BCxV, value=False)
-        logits_BCxV = logits_BCxV.masked_fill(mask, -torch.inf)
+
+    if audio_eos_value is not None and audio_eos_value >= 0:
+        top_logit_indices_BC = torch.argmax(logits_BCxV, dim=-1)
+        eos_not_highest_mask_BC = top_logit_indices_BC != audio_eos_value
+        mask_eos_unless_highest_BCxV = torch.zeros_like(logits_BCxV, dtype=torch.bool)
+        if eos_not_highest_mask_BC.any():
+            mask_eos_unless_highest_BCxV[eos_not_highest_mask_BC, audio_eos_value] = True
+        logits_BCxV = logits_BCxV.masked_fill(mask_eos_unless_highest_BCxV, -torch.inf)
 
     if top_p < 1.0:
         probs_BCxV = torch.softmax(logits_BCxV, dim=-1)
@@ -87,6 +91,7 @@ class Dia:
 
         Args:
             config: The configuration object for the model.
+            compute_dtype: The computation dtype to use.
             device: The device to load the model onto. If None, will automatically select the best available device.
 
         Raises:
@@ -100,6 +105,7 @@ class Dia:
         self.compute_dtype = compute_dtype.to_dtype()
         self.model = DiaModel(config, self.compute_dtype)
         self.dac_model = None
+        self._compiled_step = None
 
     @classmethod
     def from_local(
@@ -114,6 +120,7 @@ class Dia:
         Args:
             config_path: Path to the configuration JSON file.
             checkpoint_path: Path to the model checkpoint (.pth) file.
+            compute_dtype: The computation dtype to use.
             device: The device to load the model onto. If None, will automatically select the best available device.
 
         Returns:
@@ -168,11 +175,17 @@ class Dia:
         """
         if isinstance(compute_dtype, str):
             compute_dtype = ComputeDtype(compute_dtype)
-        loaded_model = DiaModel.from_pretrained(model_name, compute_dtype=compute_dtype.to_dtype())
-        config = loaded_model.config
+
+        # Load model directly using DiaModel's from_pretrained which handles HF download
+        try:
+            loaded_model = DiaModel.from_pretrained(model_name, compute_dtype=compute_dtype.to_dtype())
+        except Exception as e:
+            raise RuntimeError(f"Error loading model from Hugging Face Hub ({model_name})") from e
+
+        config = loaded_model.config  # Get config from the loaded model
         dia = cls(config, compute_dtype, device)
 
-        dia.model = loaded_model
+        dia.model = loaded_model  # Assign the already loaded model
         dia.model.to(dia.device)
         dia.model.eval()
         dia._load_dac_model()
@@ -182,6 +195,7 @@ class Dia:
         try:
             dac_model_path = dac.utils.download()
             dac_model = dac.DAC.load(dac_model_path).to(self.device)
+            dac_model.eval()  # Ensure DAC is in eval mode
         except Exception as e:
             raise RuntimeError("Failed to load DAC model") from e
         self.dac_model = dac_model
@@ -192,15 +206,19 @@ class Dia:
         max_len = self.config.data.text_length
 
         byte_text = text.encode("utf-8")
+        # Replace special tokens with their byte values if needed by the specific tokenizer/config
+        # Assuming byte values 1 and 2 are correct placeholders based on original code
         replaced_bytes = byte_text.replace(b"[S1]", b"\x01").replace(b"[S2]", b"\x02")
-        text_tokens = list(replaced_bytes)
+        text_tokens = list(replaced_bytes)  # Convert to list of integer byte values
 
         current_len = len(text_tokens)
         padding_needed = max_len - current_len
         if padding_needed <= 0:
+            # Truncate if too long
             text_tokens = text_tokens[:max_len]
             padded_text_np = np.array(text_tokens, dtype=np.uint8)
         else:
+            # Pad if too short
             padded_text_np = np.pad(
                 text_tokens,
                 (0, padding_needed),
@@ -208,13 +226,13 @@ class Dia:
                 constant_values=text_pad_value,
             ).astype(np.uint8)
 
-        src_tokens = torch.from_numpy(padded_text_np).to(torch.int).to(self.device).unsqueeze(0)  # [1, S]
+        # Convert to tensor
+        src_tokens = torch.from_numpy(padded_text_np).to(torch.long).to(self.device).unsqueeze(0)  # [1, S] (use long)
         return src_tokens
 
     def _prepare_audio_prompt(self, audio_prompts: list[torch.Tensor | None]) -> tuple[torch.Tensor, list[int]]:
         num_channels = self.config.data.channels
         audio_bos_value = self.config.data.audio_bos_value
-        audio_pad_value = self.config.data.audio_pad_value
         delay_pattern = self.config.data.delay_pattern
         max_delay_pattern = max(delay_pattern)
         batch_size = len(audio_prompts)
@@ -235,8 +253,12 @@ class Dia:
             if prompt is None:
                 current_prompt = bos
             else:
-                # Ensure prompt is on the correct device
-                prompt = prompt.to(self.device)
+                # Ensure prompt is on the correct device and has correct dtype
+                prompt = prompt.to(device=self.device, dtype=torch.long)  # Use long
+                if prompt.dim() != 2 or prompt.shape[1] != num_channels:
+                    raise ValueError(
+                        f"Audio prompt {i} has incorrect shape {prompt.shape}. Expected [T, {num_channels}]"
+                    )
                 current_prompt = torch.cat([bos, prompt], dim=0)
 
             current_len = current_prompt.shape[0]
@@ -251,7 +273,7 @@ class Dia:
             if padding_needed > 0:
                 pad_tensor = torch.full(
                     (padding_needed, num_channels),
-                    fill_value=-1,
+                    fill_value=-1,  # Use -1 as temporary pad before delay application
                     dtype=torch.int,
                     device=self.device,
                 )
@@ -280,6 +302,7 @@ class Dia:
             delay_pattern=delay_pattern,
         )
 
+        # Apply audio delay expects long tensor and replaces -1 with pad_value
         delayed_batch = apply_audio_delay(
             audio_BxTxC=batched_prompts_padded,
             pad_value=-1,
@@ -346,43 +369,49 @@ class Dia:
 
     def _decoder_step(
         self,
-        tokens_Bx1xC: torch.Tensor,
+        tokens_Bx1xC: torch.Tensor,  # Shape [2*B, 1, C]
         dec_state: DecoderInferenceState,
         cfg_scale: float,
         temperature: float,
         top_p: float,
-        cfg_filter_top_k: int,
-    ) -> torch.Tensor:
+        cfg_filter_top_k: int | None,  # Use this for CFG-Filter 'k'
+    ) -> torch.Tensor:  # Returns shape [B, C]
         audio_eos_value = self.config.data.audio_eos_value
+
         logits_2Bx1xCxV = self.model.decoder.decode_step(tokens_Bx1xC, dec_state)
-        B = tokens_Bx1xC.shape[0] // 2  # Original batch size
+        B = tokens_Bx1xC.shape[0] // 2
 
         logits_last_2BxCxV = logits_2Bx1xCxV[:, -1, :, :]
-        # Reshape to [B, 2, C, V] to separate uncond and cond logits
         logits_last_Bx2xCxV = logits_last_2BxCxV.view(B, 2, *logits_last_2BxCxV.shape[1:])
 
         uncond_logits_BxCxV = logits_last_Bx2xCxV[:, 0, :, :]  # Shape [B, C, V]
         cond_logits_BxCxV = logits_last_Bx2xCxV[:, 1, :, :]  # Shape [B, C, V]
 
-        logits_BxCxV = cond_logits_BxCxV + cfg_scale * (cond_logits_BxCxV - uncond_logits_BxCxV)
+        cfg_logits_BxCxV = cond_logits_BxCxV + cfg_scale * (cond_logits_BxCxV - uncond_logits_BxCxV)
 
-        # Apply EOS masking
-        logits_BxCxV[:, :, audio_eos_value + 1 :] = -torch.inf  # Mask tokens after EOS for all channels
-        logits_BxCxV[:, 1:, audio_eos_value:] = -torch.inf  # Mask EOS token for channels > 0
-        logits_BxCxV[:, 0, audio_eos_value] *= 0.5
+        if cfg_filter_top_k is not None and cfg_filter_top_k > 0:
+            k = cfg_filter_top_k
+            _, top_k_indices_BxCxk = torch.topk(cond_logits_BxCxV, k=k, dim=-1)
+            mask_BxCxV = torch.ones_like(cfg_logits_BxCxV, dtype=torch.bool)
+            mask_BxCxV.scatter_(dim=-1, index=top_k_indices_BxCxk, value=False)
+            sample_logits_BxCxV = cfg_logits_BxCxV.masked_fill(mask_BxCxV, -torch.inf)
+        else:
+            sample_logits_BxCxV = cfg_logits_BxCxV
 
-        # Flatten B and C dimensions for sampling
-        # Shape: [B*C, V]
-        flat_logits_BCxV = logits_BxCxV.view(B * self.config.data.channels, -1)
+        if audio_eos_value is not None and audio_eos_value >= 0:
+            sample_logits_BxCxV[:, :, audio_eos_value + 1 :] = -torch.inf
+            sample_logits_BxCxV[:, 1:, audio_eos_value] = -torch.inf
+            sample_logits_BxCxV[:, 0, audio_eos_value] *= 0.8
+
+        flat_logits_BCxV = sample_logits_BxCxV.view(B * self.config.data.channels, -1)
 
         pred_BC = _sample_next_token(
             flat_logits_BCxV.float(),
             temperature=temperature,
             top_p=top_p,
-            cfg_filter_top_k=cfg_filter_top_k,
+            audio_eos_value=audio_eos_value,
         )
 
-        # Reshape back to [B, C]
         pred_BxC = pred_BC.view(B, self.config.data.channels)
         return pred_BxC
 
@@ -440,11 +469,11 @@ class Dia:
         self,
         text: str | list[str],
         max_tokens: int | None = None,
-        cfg_scale: float = 3.0,
-        temperature: float = 1.3,
+        cfg_scale: float = 4.0,
+        temperature: float = 1.5,
         top_p: float = 0.95,
         use_torch_compile: bool = False,
-        cfg_filter_top_k: int = 35,
+        cfg_filter_top_k: int = 25,
         audio_prompt: list[str | torch.Tensor | None] | str | torch.Tensor | None = None,
         audio_prompt_path: list[str | torch.Tensor | None] | str | torch.Tensor | None = None,
         use_cfg_filter: bool | None = None,
@@ -489,7 +518,11 @@ class Dia:
 
         # --- Compile step function if needed ---
         if use_torch_compile:
-            step_fn = torch.compile(self._decoder_step, mode="default")
+            if self._compiled_step is None:
+                step_fn = torch.compile(self._decoder_step, mode="default")
+                self._compiled_step = step_fn
+            else:
+                step_fn = self._compiled_step
         else:
             step_fn = self._decoder_step
 
